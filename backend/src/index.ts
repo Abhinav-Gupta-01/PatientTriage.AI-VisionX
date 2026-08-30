@@ -5,6 +5,7 @@ import path from "path";
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 dotenv.config();
 import routes from "./routes";
+import clinicianRoutes from "./routes/clinicianRoutes";
 
 const app = express();
 app.use(cors());
@@ -12,6 +13,7 @@ app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (_req, res) => res.json({ service: "PatientTriage API", version: "1.0.0" }));
 app.use("/api", routes);
+app.use("/api", clinicianRoutes);
 
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error(err);
