@@ -26,3 +26,32 @@ export function ConfidenceBar({ c }: { c?: number }) {
     </div>
   );
 }
+
+export function NewsBadge({ score, risk }: { score?: number; risk?: string }) {
+  if (score === undefined || score === null) {
+    return <span className="badge bg-slate-100 text-slate-600">-</span>;
+  }
+  const map: any = {
+    HIGH: "bg-red-100 text-red-700",
+    MEDIUM: "bg-orange-100 text-orange-700",
+    LOW: "bg-green-100 text-green-700"
+  };
+  const cls = map[risk || "LOW"] || "bg-slate-100 text-slate-600";
+  return (
+    <span className={"badge " + cls} title="NEWS2-style Early Warning Score">
+      NEWS {score}
+    </span>
+  );
+}
+
+export function NewsTrendBadge({ direction }: { direction?: string }) {
+  if (!direction || direction === "UNKNOWN") {
+    return <span className="badge bg-slate-100 text-slate-500">No trend</span>;
+  }
+  const map: any = {
+    WORSENING: "bg-red-100 text-red-700",
+    IMPROVING: "bg-green-100 text-green-700",
+    STABLE: "bg-slate-100 text-slate-600"
+  };
+  return <span className={"badge " + (map[direction] || "bg-slate-100 text-slate-600")}>{direction}</span>;
+}
