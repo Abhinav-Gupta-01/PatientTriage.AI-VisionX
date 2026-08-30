@@ -248,18 +248,35 @@ export default function AddPatient() {
         )}
 
         {step === 4 && (
-          <div className="space-y-2 text-sm">
-            <div className="text-slate-500">
+          <div className="space-y-4">
+            <div className="text-sm font-medium text-slate-500">
               Review patient data before analysis:
             </div>
 
-            <pre className="bg-slate-50 p-3 rounded-lg text-xs overflow-x-auto">
-              {JSON.stringify(f, null, 2)}
-            </pre>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4 bg-slate-50/80 backdrop-blur p-5 rounded-xl border border-slate-200 shadow-sm">
+              {Object.entries(f).map(([key, value]) => (
+                <div key={key} className="flex flex-col">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    {key.replace(/_/g, " ")}
+                  </span>
+                  <span className="text-sm font-medium text-slate-800 mt-0.5">
+                    {value !== "" ? String(value) : "—"}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
-        {err && <div className="text-sm text-red-600">{err}</div>}
+        {err && (
+          <div className="flex items-start gap-3 p-4 bg-red-50/80 backdrop-blur border border-red-200/60 rounded-xl text-red-700 shadow-sm">
+            <span className="mt-0.5 text-red-500">⚠️</span>
+            <div>
+              <div className="font-bold text-sm">Submission Failed</div>
+              <div className="text-xs font-medium mt-1 opacity-90">{err}</div>
+            </div>
+          </div>
+        )}
 
         <div className="flex justify-between pt-2">
           <button
