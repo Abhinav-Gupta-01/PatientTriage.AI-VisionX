@@ -15,7 +15,34 @@ export async function resolveAlert(req: AuthReq, res: Response) {
 
 export async function auditLogs(_req: AuthReq, res: Response) {
   const { data } = await supabase.from("audit_logs").select("*").order("created_at", { ascending: false }).limit(500);
-  res.json(data || []);
+  
+  if (!data) return res.json([]);
+
+  const { data: users } = await supabase.from("users").select("id, full_name");
+  const userMap = new Map();
+  if (users) {
+    users.forEach(u => userMap.set(u.id, u.full_name));
+  }
+
+  const enriched = data.map(log => {
+    if (log.details) {
+      if (log.details.new_doctor_id && userMap.has(log.details.new_doctor_id)) {
+        log.details.new_doctor_name = userMap.get(log.details.new_doctor_id);
+      }
+      if (log.details.new_nurse_id && userMap.has(log.details.new_nurse_id)) {
+        log.details.new_nurse_name = userMap.get(log.details.new_nurse_id);
+      }
+      if (log.details.previous_doctor_id && userMap.has(log.details.previous_doctor_id)) {
+        log.details.previous_doctor_name = userMap.get(log.details.previous_doctor_id);
+      }
+      if (log.details.previous_nurse_id && userMap.has(log.details.previous_nurse_id)) {
+        log.details.previous_nurse_name = userMap.get(log.details.previous_nurse_id);
+      }
+    }
+    return log;
+  });
+
+  res.json(enriched);
 }
 
 export async function analytics(_req: AuthReq, res: Response) {

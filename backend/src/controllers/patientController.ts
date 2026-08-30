@@ -1,694 +1,513 @@
-import { Response } from "express";
+import { Request, Response } from "express";
 import { supabase } from "../config/supabase";
-import { AuthReq } from "../middleware/auth";
 import { assessPatient } from "../services/triageService";
 
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+function getUserId(req: Request) {
+  return (
+    (req as any).user?.id ||
+    (req as any).user?.user_id ||
+    (req as any).userId ||
+    null
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| NEWS2-style score from vitals
+|--------------------------------------------------------------------------
+*/
+
+function computeNewsScore(vitals: any): { score: number; risk: string } {
+  if (!vitals) return { score: 0, risk: "LOW" };
+
+  let score = 0;
+
+  // Respiratory rate
+  const rr = Number(vitals.respiratory_rate || 0);
+  if (rr <= 8) score += 3;
+  else if (rr <= 11) score += 1;
+  else if (rr >= 25) score += 3;
+  else if (rr >= 21) score += 2;
+
+  // SpO2
+  const spo2 = Number(vitals.spo2 || 100);
+  if (spo2 <= 91) score += 3;
+  else if (spo2 <= 93) score += 2;
+  else if (spo2 <= 95) score += 1;
+
+  // Systolic BP
+  const sbp = Number(vitals.systolic_bp || 120);
+  if (sbp <= 90) score += 3;
+  else if (sbp <= 100) score += 2;
+  else if (sbp <= 110) score += 1;
+  else if (sbp >= 220) score += 3;
+
+  // Heart rate
+  const hr = Number(vitals.heart_rate || 75);
+  if (hr <= 40) score += 3;
+  else if (hr <= 50) score += 1;
+  else if (hr >= 131) score += 3;
+  else if (hr >= 111) score += 2;
+  else if (hr >= 91) score += 1;
+
+  // Temperature
+  const temp = Number(vitals.temperature || 37);
+  if (temp <= 35) score += 3;
+  else if (temp <= 36) score += 1;
+  else if (temp >= 39.1) score += 2;
+  else if (temp >= 38.1) score += 1;
+
+  const risk = score >= 7 ? "HIGH" : score >= 5 ? "MEDIUM" : "LOW";
+  return { score, risk };
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/patients
+|
+| Returns patients enriched with latest triage, vitals, waiting_minutes,
+| and NEWS score so the frontend can display all data correctly.
+|--------------------------------------------------------------------------
+*/
+
 export async function listPatients(
-  req: AuthReq,
+  req: Request,
   res: Response
 ) {
   try {
-    const {
-      data: patients,
-      error: patientsError,
-    } = await supabase
+    const status = req.query.status as string | undefined;
+
+    let query = supabase
       .from("patients")
       .select("*")
       .order("arrival_time", {
         ascending: true,
       });
 
-    if (patientsError) {
+    if (status) {
+      query = query.eq("status", status);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
       console.error(
-        "List patients error:",
-        patientsError
+        "LIST PATIENTS ERROR:",
+        error
       );
 
       return res.status(500).json({
-        error: "Failed to fetch patients",
+        message: "Failed to fetch patients",
+        error: error.message,
       });
     }
 
-    if (!patients || patients.length === 0) {
-      return res.json([]);
+    const patients = data || [];
+
+    if (patients.length === 0) {
+      return res.json({ patients: [] });
     }
 
-    const ids = patients.map(
-      (p) => p.id
-    );
+    /*
+     * Fetch latest triage for all patients in one query
+     */
+    const patientIds = patients.map((p: any) => p.id);
 
-    const {
-      data: triages,
-      error: triagesError,
-    } = await supabase
+    const { data: allTriages } = await supabase
       .from("triage_assessments")
       .select("*")
-      .in("patient_id", ids)
-      .order("created_at", {
-        ascending: false,
-      });
+      .in("patient_id", patientIds)
+      .order("created_at", { ascending: false });
 
-    if (triagesError) {
-      console.error(
-        "List patient triages error:",
-        triagesError
-      );
+    /*
+     * Fetch latest vitals for all patients in one query
+     */
+    const { data: allVitals } = await supabase
+      .from("patient_vitals")
+      .select("*")
+      .in("patient_id", patientIds)
+      .order("recorded_at", { ascending: false });
 
-      return res.status(500).json({
-        error: "Failed to fetch triage assessments",
+    /*
+     * Build lookup maps: only keep the latest record per patient
+     */
+    const latestTriage: Record<string, any> = {};
+    for (const t of (allTriages || [])) {
+      if (!latestTriage[t.patient_id]) {
+        latestTriage[t.patient_id] = t;
+      }
+    }
+
+    const latestVitals: Record<string, any> = {};
+    for (const v of (allVitals || [])) {
+      if (!latestVitals[v.patient_id]) {
+        latestVitals[v.patient_id] = v;
+      }
+    }
+
+    /*
+     * Enrich each patient with triage, vitals, waiting_minutes, and NEWS
+     */
+    const now = Date.now();
+
+    const enriched = patients.map((p: any) => {
+      const triage = latestTriage[p.id] || null;
+      const vitals = latestVitals[p.id] || null;
+      const waiting_minutes = p.arrival_time
+        ? Math.floor((now - new Date(p.arrival_time).getTime()) / 60000)
+        : 0;
+      const news = computeNewsScore(vitals);
+
+      return {
+        ...p,
+        triage: triage
+          ? {
+              priority: triage.priority,
+              priority_label: triage.priority_label,
+              deterioration_risk: triage.deterioration_risk,
+              risk_probability: triage.risk_probability,
+              confidence: triage.confidence,
+              care_pathway: triage.care_pathway,
+              reassessment_minutes: triage.reassessment_minutes,
+              key_factors: triage.key_factors,
+              explanation: triage.explanation,
+              recommendation: triage.recommendation,
+            }
+          : null,
+        vitals: vitals
+          ? {
+              heart_rate: vitals.heart_rate,
+              systolic_bp: vitals.systolic_bp,
+              diastolic_bp: vitals.diastolic_bp,
+              spo2: vitals.spo2,
+              respiratory_rate: vitals.respiratory_rate,
+              temperature: vitals.temperature,
+              recorded_at: vitals.recorded_at,
+            }
+          : null,
+        waiting_minutes,
+        news,
+      };
+    });
+
+    return res.json({
+      patients: enriched,
+    });
+  } catch (error: any) {
+    console.error(
+      "LIST PATIENTS ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/patients/:id
+|
+| Returns complete patient information including:
+| - latest vitals
+| - latest triage assessment
+|--------------------------------------------------------------------------
+*/
+
+export async function getPatient(
+  req: Request,
+  res: Response
+) {
+  try {
+    const { id } = req.params;
+
+    const {
+      data: patient,
+      error: patientError,
+    } = await supabase
+      .from("patients")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (patientError || !patient) {
+      return res.status(404).json({
+        message: "Patient not found",
       });
     }
 
+    /*
+     * Latest vitals
+     */
     const {
       data: vitals,
       error: vitalsError,
     } = await supabase
       .from("patient_vitals")
       .select("*")
-      .in("patient_id", ids)
+      .eq("patient_id", id)
       .order("recorded_at", {
         ascending: false,
-      });
+      })
+      .limit(1)
+      .maybeSingle();
 
     if (vitalsError) {
       console.error(
-        "List patient vitals error:",
+        "GET PATIENT VITALS ERROR:",
         vitalsError
       );
-
-      return res.status(500).json({
-        error: "Failed to fetch patient vitals",
-      });
     }
 
-    const enriched = patients.map((p) => {
-      const t = triages?.find(
-        (x) => x.patient_id === p.id
-      );
-
-      const v = vitals?.find(
-        (x) => x.patient_id === p.id
-      );
-
-      const arrivalTime = new Date(
-        p.arrival_time
-      ).getTime();
-
-      const waiting = Number.isFinite(arrivalTime)
-        ? Math.max(
-            0,
-            Math.floor(
-              (Date.now() - arrivalTime) / 60000
-            )
-          )
-        : 0;
-
-      return {
-        ...p,
-        triage: t,
-        vitals: v,
-        waiting_minutes: waiting,
-      };
-    });
-
-    enriched.sort((a, b) => {
-      const pa =
-        a.triage?.priority ?? 5;
-
-      const pb =
-        b.triage?.priority ?? 5;
-
-      if (pa !== pb) {
-        return pa - pb;
-      }
-
-      const ra =
-        Number(a.triage?.risk_probability ?? 0);
-
-      const rb =
-        Number(b.triage?.risk_probability ?? 0);
-
-      if (rb !== ra) {
-        return rb - ra;
-      }
-
-      return (
-        b.waiting_minutes -
-        a.waiting_minutes
-      );
-    });
-
-    return res.json(enriched);
-  } catch (error) {
-    console.error(
-      "listPatients error:",
-      error
-    );
-
-    return res.status(500).json({
-      error: "Failed to fetch patients",
-    });
-  }
-}
-
-export async function getPatient(
-  req: AuthReq,
-  res: Response
-) {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        error: "Patient ID is required",
-      });
-    }
-
+    /*
+     * Latest triage assessment
+     */
     const {
-      data: patient,
-      error: patientError,
+      data: triage,
+      error: triageError,
     } = await supabase
-      .from("patients")
+      .from("triage_assessments")
       .select("*")
-      .eq("id", id)
-      .single();
+      .eq("patient_id", id)
+      .order("created_at", {
+        ascending: false,
+      })
+      .limit(1)
+      .maybeSingle();
 
-    if (patientError) {
+    if (triageError) {
       console.error(
-        "Get patient error:",
-        patientError
+        "GET PATIENT TRIAGE ERROR:",
+        triageError
       );
-
-      return res.status(404).json({
-        error: "Patient not found",
-      });
     }
-
-    if (!patient) {
-      return res.status(404).json({
-        error: "Patient not found",
-      });
-    }
-
-    const [
-      vitalsResult,
-      triagesResult,
-      alertsResult,
-      decisionsResult,
-      reassessmentsResult,
-    ] = await Promise.all([
-      supabase
-        .from("patient_vitals")
-        .select("*")
-        .eq("patient_id", id)
-        .order("recorded_at", {
-          ascending: true,
-        }),
-
-      supabase
-        .from("triage_assessments")
-        .select("*")
-        .eq("patient_id", id)
-        .order("created_at", {
-          ascending: false,
-        }),
-
-      supabase
-        .from("alerts")
-        .select("*")
-        .eq("patient_id", id)
-        .order("created_at", {
-          ascending: false,
-        }),
-
-      supabase
-        .from("clinician_decisions")
-        .select("*")
-        .eq("patient_id", id)
-        .order("created_at", {
-          ascending: false,
-        }),
-
-      supabase
-        .from("reassessments")
-        .select("*")
-        .eq("patient_id", id)
-        .order("created_at", {
-          ascending: false,
-        }),
-    ]);
-
-    if (vitalsResult.error) {
-      console.error(
-        "Get patient vitals error:",
-        vitalsResult.error
-      );
-
-      return res.status(500).json({
-        error: "Failed to fetch patient vitals",
-      });
-    }
-
-    if (triagesResult.error) {
-      console.error(
-        "Get patient triages error:",
-        triagesResult.error
-      );
-
-      return res.status(500).json({
-        error: "Failed to fetch patient triage assessments",
-      });
-    }
-
-    if (alertsResult.error) {
-      console.error(
-        "Get patient alerts error:",
-        alertsResult.error
-      );
-
-      return res.status(500).json({
-        error: "Failed to fetch patient alerts",
-      });
-    }
-
-    if (decisionsResult.error) {
-      console.error(
-        "Get patient decisions error:",
-        decisionsResult.error
-      );
-
-      return res.status(500).json({
-        error: "Failed to fetch clinician decisions",
-      });
-    }
-
-    if (reassessmentsResult.error) {
-      console.error(
-        "Get patient reassessments error:",
-        reassessmentsResult.error
-      );
-
-      return res.status(500).json({
-        error: "Failed to fetch reassessments",
-      });
-    }
-
-    const vitals =
-      vitalsResult.data || [];
-
-    const triages =
-      triagesResult.data || [];
-
-    const alerts =
-      alertsResult.data || [];
-
-    const decisions =
-      decisionsResult.data || [];
-
-    const reassessments =
-      reassessmentsResult.data || [];
-
-    const arrivalTime = new Date(
-      patient.arrival_time
-    ).getTime();
-
-    const waiting = Number.isFinite(arrivalTime)
-      ? Math.max(
-          0,
-          Math.floor(
-            (Date.now() - arrivalTime) / 60000
-          )
-        )
-      : 0;
 
     return res.json({
-      ...patient,
-      vitals,
-      triages,
-      alerts,
-      decisions,
-      reassessments,
-      waiting_minutes: waiting,
-      latest_triage: triages[0],
-      latest_vitals:
-        vitals[vitals.length - 1],
+      patient: {
+        ...patient,
+        latest_triage: triage || null,
+        triage: triage || null,
+        latest_vitals: vitals || null,
+        waiting_minutes: patient.arrival_time
+          ? Math.floor((Date.now() - new Date(patient.arrival_time).getTime()) / 60000)
+          : 0,
+        news: computeNewsScore(vitals),
+      },
+      vitals: vitals || null,
+      triage: triage || null,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error(
-      "getPatient error:",
+      "GET PATIENT ERROR:",
       error
     );
 
     return res.status(500).json({
-      error: "Failed to fetch patient",
+      message: "Internal server error",
     });
   }
 }
+
+/*
+|--------------------------------------------------------------------------
+| POST /api/patients
+|
+| Creates a new patient.
+|--------------------------------------------------------------------------
+*/
 
 export async function createPatient(
-  req: AuthReq,
+  req: Request,
   res: Response
 ) {
   try {
-    const b = req.body;
+    let {
+      patient_code,
+      age,
+      sex,
+      medical_history,
+      medications,
+      allergies,
+      chief_complaint,
+      symptoms,
+      pain_score,
+      duration,
+      consciousness,
+      distress,
+      mobility,
+      is_simulated,
+      heart_rate,
+      systolic_bp,
+      diastolic_bp,
+      spo2,
+      respiratory_rate,
+      temperature,
+    } = req.body;
+
+    if (!patient_code || !String(patient_code).trim()) {
+      patient_code = "PT-" + Math.floor(Math.random() * 900000 + 100000);
+    }
 
     if (
-      typeof b.age !== "number" ||
-      b.age < 0 ||
-      b.age > 120
+      age === undefined ||
+      age === null ||
+      !Number.isInteger(Number(age)) ||
+      Number(age) < 0
     ) {
       return res.status(400).json({
-        error: "Invalid age",
+        message: "Valid age is required",
       });
     }
-
-    const requiredVitals = [
-      "heart_rate",
-      "systolic_bp",
-      "diastolic_bp",
-      "spo2",
-      "respiratory_rate",
-      "temperature",
-    ];
-
-    for (const field of requiredVitals) {
-      if (
-        b[field] === undefined ||
-        b[field] === null ||
-        !Number.isFinite(
-          Number(b[field])
-        )
-      ) {
-        return res.status(400).json({
-          error: `Missing or invalid ${field}`,
-        });
-      }
-    }
-
-    const code =
-      b.patient_code ||
-      `P${Math.floor(
-        1000 + Math.random() * 9000
-      )}`;
-
-    const {
-      data: patient,
-      error: patientError,
-    } = await supabase
-      .from("patients")
-      .insert({
-        patient_code: code,
-        age: b.age,
-        sex: b.sex,
-        medical_history:
-          b.medical_history,
-        medications:
-          b.medications,
-        allergies:
-          b.allergies,
-        chief_complaint:
-          b.chief_complaint,
-        symptoms:
-          b.symptoms,
-        pain_score:
-          b.pain_score,
-        duration:
-          b.duration,
-        consciousness:
-          b.consciousness ||
-          "Alert",
-        distress:
-          b.distress ||
-          "None",
-        mobility:
-          b.mobility ||
-          "Ambulatory",
-        is_simulated: true,
-        status: "Waiting",
-      })
-      .select()
-      .single();
 
     if (
-      patientError ||
-      !patient
+      chief_complaint === undefined ||
+      chief_complaint === null ||
+      !String(chief_complaint).trim()
     ) {
-      console.error(
-        "Patient insert failed:",
-        patientError
-      );
-
       return res.status(400).json({
-        error:
-          patientError?.message ||
-          "Failed to create patient",
+        message: "chief_complaint is required",
       });
     }
 
     const {
-      error: vitalsError,
-    } = await supabase
-      .from("patient_vitals")
-      .insert({
-        patient_id: patient.id,
-        heart_rate: b.heart_rate,
-        systolic_bp:
-          b.systolic_bp,
-        diastolic_bp:
-          b.diastolic_bp,
-        spo2: b.spo2,
-        respiratory_rate:
-          b.respiratory_rate,
-        temperature:
-          b.temperature,
-      });
-
-    if (vitalsError) {
-      console.error(
-        "Vitals insert failed:",
-        vitalsError
-      );
-
-      await supabase
-        .from("patients")
-        .delete()
-        .eq("id", patient.id);
-
-      return res.status(400).json({
-        error:
-          "Failed to save patient vitals",
-      });
-    }
-
-    let triage;
-
-    try {
-      triage =
-        await assessPatient(
-          patient.id
-        );
-    } catch (error) {
-      console.error(
-        "Initial triage failed:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Patient created, but initial triage failed",
-        patient_id:
-          patient.id,
-      });
-    }
-
-    const {
-      error: auditError,
-    } = await supabase
-      .from("audit_logs")
-      .insert({
-        user_id:
-          req.user!.id,
-        user_email:
-          req.user!.email,
-        user_role:
-          req.user!.role,
-        patient_id:
-          patient.id,
-        action:
-          "PATIENT_CREATED",
-        details: {
-          patient_code:
-            code,
-          triage_id:
-            triage?.id,
-        },
-      });
-
-    if (auditError) {
-      console.error(
-        "Audit log failed:",
-        auditError
-      );
-    }
-
-    return res.status(201).json({
-      patient,
-      triage,
-    });
-  } catch (error) {
-    console.error(
-      "createPatient error:",
-      error
-    );
-
-    return res.status(500).json({
-      error:
-        "Internal server error",
-    });
-  }
-}
-
-export async function reassess(
-  req: AuthReq,
-  res: Response
-) {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        error: "Patient ID is required",
-      });
-    }
-
-    const {
-      data: patient,
-      error: patientError,
+      data: existingPatient,
+      error: existingError,
     } = await supabase
       .from("patients")
       .select("id")
-      .eq("id", id)
-      .single();
+      .eq(
+        "patient_code",
+        String(patient_code).trim()
+      )
+      .maybeSingle();
 
-    if (patientError) {
-      console.error(
-        "Reassess patient lookup error:",
-        patientError
-      );
-
-      return res.status(404).json({
-        error: "Patient not found",
+    if (existingError) {
+      return res.status(500).json({
+        message: "Failed to validate patient code",
       });
     }
 
-    if (!patient) {
-      return res.status(404).json({
-        error: "Patient not found",
+    if (existingPatient) {
+      return res.status(409).json({
+        message: "Patient code already exists",
       });
     }
 
-    let triage;
+    const { data: patient, error } =
+      await supabase
+        .from("patients")
+        .insert({
+          patient_code: String(patient_code).trim(),
+          age: Number(age),
+          sex: sex || null,
+          medical_history: medical_history || null,
+          medications: medications || null,
+          allergies: allergies || null,
+          chief_complaint: String(chief_complaint).trim(),
+          symptoms: symptoms || null,
+          pain_score: pain_score !== undefined && pain_score !== null ? Number(pain_score) : null,
+          duration: duration || null,
+          consciousness: consciousness || "Alert",
+          distress: distress || "None",
+          mobility: mobility || "Ambulatory",
+          status: "Waiting",
+          is_simulated: is_simulated !== undefined ? Boolean(is_simulated) : false,
+        })
+        .select("*")
+        .single();
+
+    if (error || !patient) {
+      return res.status(500).json({
+        message: "Failed to create patient",
+        error: error?.message,
+      });
+    }
+
+    if (heart_rate || systolic_bp || spo2 || respiratory_rate || temperature) {
+      await supabase.from("patient_vitals").insert({
+        patient_id: patient.id,
+        heart_rate: heart_rate ? Number(heart_rate) : null,
+        systolic_bp: systolic_bp ? Number(systolic_bp) : null,
+        diastolic_bp: diastolic_bp ? Number(diastolic_bp) : null,
+        spo2: spo2 ? Number(spo2) : null,
+        respiratory_rate: respiratory_rate ? Number(respiratory_rate) : null,
+        temperature: temperature ? Number(temperature) : null,
+      });
+    }
 
     try {
-      triage =
-        await assessPatient(id);
-    } catch (error) {
-      console.error(
-        "Reassessment failed:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          "Failed to reassess patient",
-      });
+      await assessPatient(patient.id);
+    } catch (triageError) {
+      console.error("CREATE PATIENT TRIAGE ERROR:", triageError);
     }
 
-    if (!triage) {
-      return res.status(500).json({
-        error:
-          "Assessment failed",
-      });
-    }
+    const userId = getUserId(req);
 
-    const {
-      error: auditError,
-    } = await supabase
-      .from("audit_logs")
-      .insert({
-        user_id:
-          req.user!.id,
-        user_email:
-          req.user!.email,
-        user_role:
-          req.user!.role,
-        patient_id: id,
-        action: "REASSESS",
+    if (userId) {
+      await supabase.from("audit_logs").insert({
+        user_id: userId,
+        patient_id: patient.id,
+        action: "patient_created",
         details: {
-          triage_id:
-            triage.id,
+          patient_code: patient.patient_code,
+          status: "Waiting",
         },
       });
-
-    if (auditError) {
-      console.error(
-        "Audit log failed:",
-        auditError
-      );
     }
 
-    return res.json(triage);
-  } catch (error) {
+    return res.status(201).json({
+      message: "Patient created successfully",
+      patient,
+    });
+  } catch (error: any) {
     console.error(
-      "reassess error:",
+      "CREATE PATIENT ERROR:",
       error
     );
 
     return res.status(500).json({
-      error:
-        "Failed to reassess patient",
+      message: "Internal server error",
     });
   }
 }
 
-export async function decision(
-  req: AuthReq,
+/*
+|--------------------------------------------------------------------------
+| POST /api/patients/:id/reassess
+|
+| Records a reassessment.
+|--------------------------------------------------------------------------
+*/
+
+export async function reassess(
+  req: Request,
   res: Response
 ) {
   try {
     const { id } = req.params;
 
     const {
-      action,
       new_priority,
-      new_pathway,
+      new_risk,
       reason,
+      heart_rate,
+      systolic_bp,
+      diastolic_bp,
+      spo2,
+      respiratory_rate,
+      temperature,
     } = req.body;
 
-    if (!id) {
-      return res.status(400).json({
-        error: "Patient ID is required",
-      });
-    }
-
-    if (!action) {
-      return res.status(400).json({
-        error: "Decision action is required",
-      });
-    }
-
-    if (
-      action === "OVERRIDE" &&
-      (!reason ||
-        typeof reason !== "string" ||
-        reason.trim().length < 3)
-    ) {
-      return res.status(400).json({
-        error:
-          "Reason required",
-      });
-    }
-
+    /*
+     * Fetch current patient
+     */
     const {
       data: patient,
       error: patientError,
@@ -700,167 +519,263 @@ export async function decision(
 
     if (patientError || !patient) {
       return res.status(404).json({
-        error:
-          "Patient not found",
+        message: "Patient not found",
       });
     }
 
+    /*
+     * Fetch previous triage
+     */
     const {
-      data: last,
-      error: lastError,
+      data: previousTriage,
     } = await supabase
       .from("triage_assessments")
+      .select("priority, risk_probability")
+      .eq("patient_id", id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const previousPriority = previousTriage?.priority ?? null;
+    const previousRisk = previousTriage?.risk_probability ?? null;
+
+    /*
+     * Insert new vitals if provided
+     */
+    if (heart_rate || systolic_bp || diastolic_bp || spo2 || respiratory_rate || temperature) {
+      const { error: vitalsError } = await supabase.from("patient_vitals").insert({
+        patient_id: id,
+        heart_rate: heart_rate ? Number(heart_rate) : null,
+        systolic_bp: systolic_bp ? Number(systolic_bp) : null,
+        diastolic_bp: diastolic_bp ? Number(diastolic_bp) : null,
+        spo2: spo2 ? Number(spo2) : null,
+        respiratory_rate: respiratory_rate ? Number(respiratory_rate) : null,
+        temperature: temperature ? Number(temperature) : null,
+      });
+      if (vitalsError) {
+        console.error("REASSESS VITALS INSERT ERROR:", vitalsError);
+      }
+    }
+
+    /*
+     * Re-run AI Triage
+     */
+    try {
+      await assessPatient(id);
+    } catch (triageError) {
+      console.error("REASSESS TRIAGE ENGINE ERROR:", triageError);
+    }
+
+    /*
+     * Fetch the newly generated triage
+     */
+    const {
+      data: newTriage,
+    } = await supabase
+      .from("triage_assessments")
+      .select("priority, risk_probability")
+      .eq("patient_id", id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const finalPriority =
+      new_priority !== undefined && new_priority !== null
+        ? Number(new_priority)
+        : newTriage?.priority ?? previousPriority;
+
+    const finalRisk =
+      new_risk !== undefined && new_risk !== null
+        ? Number(new_risk)
+        : newTriage?.risk_probability ?? previousRisk;
+
+    /*
+     * Save reassessment log
+     */
+    const { data, error } = await supabase
+      .from("reassessments")
+      .insert({
+        patient_id: id,
+        previous_priority: previousPriority,
+        new_priority: finalPriority,
+        previous_risk: previousRisk,
+        new_risk: finalRisk,
+        reason: reason ? String(reason).trim() : null,
+      })
       .select("*")
+      .single();
+
+    if (error) {
+      console.error("CREATE REASSESSMENT ERROR:", error);
+    }
+
+    return res.status(201).json({
+      message: "Patient reassessed successfully",
+      reassessment: data || null,
+    });
+  } catch (error: any) {
+    console.error(
+      "REASSESS PATIENT ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      message: "Internal server error",
+    });
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| POST /api/patients/:id/decision
+|
+| Legacy/general clinical decision endpoint.
+|
+| Detailed Accept / Modify / Override decisions
+| are handled by clinicianDecisionController.
+|--------------------------------------------------------------------------
+*/
+
+export async function decision(
+  req: Request,
+  res: Response
+) {
+  try {
+    const { id } = req.params;
+
+    const userId = getUserId(req);
+
+    const {
+      action,
+      new_priority,
+      new_pathway,
+      reason,
+    } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Authentication required",
+      });
+    }
+
+    if (!action) {
+      return res.status(400).json({
+        message: "action is required",
+      });
+    }
+
+    /*
+     * Verify patient
+     */
+    const {
+      data: patient,
+      error: patientError,
+    } = await supabase
+      .from("patients")
+      .select("id, status")
+      .eq("id", id)
+      .single();
+
+    if (patientError || !patient) {
+      return res.status(404).json({
+        message: "Patient not found",
+      });
+    }
+
+    /*
+     * Latest triage
+     */
+    const {
+      data: triage,
+    } = await supabase
+      .from("triage_assessments")
+      .select(
+        "priority, care_pathway"
+      )
       .eq("patient_id", id)
       .order("created_at", {
         ascending: false,
       })
       .limit(1)
-      .single();
+      .maybeSingle();
 
-    if (lastError || !last) {
-      console.error(
-        "Latest triage lookup error:",
-        lastError
-      );
+    const previousPriority =
+      triage?.priority ?? null;
 
-      return res.status(400).json({
-        error:
-          "No triage assessment exists for this patient",
-      });
-    }
+    const previousPathway =
+      triage?.care_pathway ?? null;
 
+    const finalPriority =
+      new_priority !== undefined &&
+      new_priority !== null
+        ? Number(new_priority)
+        : previousPriority;
+
+    const finalPathway =
+      new_pathway ??
+      previousPathway;
+
+    /*
+     * Save using the original clinician_decisions
+     * schema fields.
+     */
     const {
-      error: decisionError,
+      data: savedDecision,
+      error,
     } = await supabase
       .from("clinician_decisions")
       .insert({
         patient_id: id,
-        user_id:
-          req.user!.id,
-        action,
+        user_id: userId,
+
+        action: String(action),
+
         previous_priority:
-          last.priority,
+          previousPriority,
+
         new_priority:
-          new_priority ??
-          last.priority,
+          finalPriority,
+
         previous_pathway:
-          last.care_pathway,
+          previousPathway,
+
         new_pathway:
-          new_pathway ??
-          last.care_pathway,
-        reason,
-      });
+          finalPathway,
 
-    if (decisionError) {
+        reason:
+          reason
+            ? String(reason).trim()
+            : null,
+      })
+      .select("*")
+      .single();
+
+    if (error) {
       console.error(
-        "Clinician decision insert error:",
-        decisionError
+        "CLINICAL DECISION ERROR:",
+        error
       );
 
-      return res.status(400).json({
-        error:
-          "Failed to save clinician decision",
+      return res.status(500).json({
+        message:
+          "Failed to save clinical decision",
+        error: error.message,
       });
     }
 
-    if (
-      action !== "ACCEPT" &&
-      new_priority
-    ) {
-      const {
-        error: triageError,
-      } = await supabase
-        .from("triage_assessments")
-        .insert({
-          patient_id: id,
-          priority:
-            new_priority,
-          priority_label:
-            last.priority_label,
-          deterioration_risk:
-            last.deterioration_risk,
-          risk_probability:
-            last.risk_probability,
-          confidence: 1.0,
-          care_pathway:
-            new_pathway ||
-            last.care_pathway,
-          reassessment_minutes:
-            last.reassessment_minutes,
-          key_factors: [
-            "Clinician " +
-              action,
-            reason || "",
-          ],
-          explanation:
-            "Clinician " +
-            action +
-            ": " +
-            (reason ||
-              "N/A"),
-          recommendation:
-            "Clinician-directed disposition",
-          model_version:
-            "clinician-override",
-        });
-
-      if (triageError) {
-        console.error(
-          "Clinician triage override insert error:",
-          triageError
-        );
-
-        return res.status(400).json({
-          error:
-            "Decision saved, but failed to save triage override",
-        });
-      }
-    }
-
-    const {
-      error: auditError,
-    } = await supabase
-      .from("audit_logs")
-      .insert({
-        user_id:
-          req.user!.id,
-        user_email:
-          req.user!.email,
-        user_role:
-          req.user!.role,
-        patient_id: id,
-        action:
-          "DECISION_" +
-          action,
-        details: {
-          new_priority,
-          new_pathway,
-          reason,
-          previous_priority:
-            last.priority,
-        },
-      });
-
-    if (auditError) {
-      console.error(
-        "Decision audit log failed:",
-        auditError
-      );
-    }
-
-    return res.json({
-      ok: true,
+    return res.status(201).json({
+      message:
+        "Clinical decision recorded successfully",
+      decision: savedDecision,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error(
-      "decision error:",
+      "DECISION ERROR:",
       error
     );
 
     return res.status(500).json({
-      error:
-        "Failed to process clinician decision",
+      message: "Internal server error",
     });
   }
 }
